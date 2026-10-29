@@ -9,7 +9,7 @@ import java.net.URL
 object GeminiClient {
 
     // Change this if Google retires the model. Check https://ai.google.dev/gemini-api/docs/models
-    const val MODEL = "gemini-2.5-flash"
+    const val MODEL = "gemini-3.5-flash-lite"
 
     private const val SYSTEM_PROMPT = """
 You control an Android phone to achieve the user's goal. Each turn you get the current
