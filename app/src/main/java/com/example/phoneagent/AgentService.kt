@@ -1,8 +1,12 @@
 package com.example.phoneagent
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.ContactsContract
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.*
@@ -38,6 +42,16 @@ class AgentService : AccessibilityService() {
 
     fun start(goal: String, apiKey: String) {
         job?.cancel()
+
+        // Fast-path: Check for direct call intent (e.g., "call Mom", "dial 9876543210")
+        val callRegex = Regex("""^(?:call|dial|phone)\s+(.+)$""", RegexOption.IGNORE_CASE)
+        val match = callRegex.find(goal.trim())
+        if (match != null) {
+            val target = match.groupValues[1].trim()
+            handleDirectCall(target)
+            return
+        }
+
         job = scope.launch { runAgent(goal, apiKey) }
     }
 
@@ -114,5 +128,95 @@ class AgentService : AccessibilityService() {
         val intent = pm.getLaunchIntentForPackage(match.activityInfo.packageName)
             ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (intent != null) startActivity(intent)
+    }
+
+    private data class ContactItem(val name: String, val number: String, val type: String)
+
+    private fun handleDirectCall(target: String) {
+        log("Goal: Call '$target'")
+
+        // If target is already a raw phone number (e.g. +1234567890, 9876543210)
+        if (target.matches(Regex("""^[+]?[\d\s\-()]{3,}$"""))) {
+            log("Direct phone number detected. Calling $target...")
+            placeCall(target)
+            return
+        }
+
+        val contacts = findContacts(target)
+        if (contacts.isEmpty()) {
+            log("❌ No contact found matching '$target'. Please verify the name or enter the number directly.")
+            return
+        }
+
+        // Deduplicate numbers by normalized digits so identical synced numbers count as one
+        val uniqueNumbers = contacts.distinctBy { it.number.replace(Regex("""[^0-9+]"""), "") }
+
+        when {
+            uniqueNumbers.size == 1 -> {
+                val match = uniqueNumbers.first()
+                log("📞 Found 1 number for '${match.name}': ${match.number} (${match.type}). Calling...")
+                placeCall(match.number)
+            }
+            else -> {
+                log("⚠️ Multiple numbers found for '$target':")
+                uniqueNumbers.forEachIndexed { i, c ->
+                    log("   [${i + 1}] ${c.name} — ${c.number} (${c.type})")
+                }
+                log("👉 Please specify the exact name or number to call.")
+            }
+        }
+    }
+
+    private fun findContacts(query: String): List<ContactItem> {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            log("⚠️ Missing Contacts permission. Please grant permission in App Info.")
+            return emptyList()
+        }
+        val results = mutableListOf<ContactItem>()
+        val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+            ContactsContract.CommonDataKinds.Phone.TYPE
+        )
+        val selection = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?"
+        val selectionArgs = arrayOf("%$query%")
+
+        try {
+            contentResolver.query(uri, projection, selection, selectionArgs, null)?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val typeIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.TYPE)
+
+                while (cursor.moveToNext()) {
+                    val name = if (nameIdx >= 0) cursor.getString(nameIdx) ?: "" else ""
+                    val num = if (numIdx >= 0) cursor.getString(numIdx) ?: "" else ""
+                    val typeInt = if (typeIdx >= 0) cursor.getInt(typeIdx) else 0
+                    val typeLabel = ContactsContract.CommonDataKinds.Phone.getTypeLabel(resources, typeInt, "").toString()
+                    if (num.isNotBlank()) {
+                        results.add(ContactItem(name, num, typeLabel))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            log("Error reading contacts: ${e.message}")
+        }
+        return results
+    }
+
+    private fun placeCall(number: String) {
+        val uri = Uri.parse("tel:${Uri.encode(number)}")
+        val intent = if (checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+            Intent(Intent.ACTION_CALL, uri)
+        } else {
+            Intent(Intent.ACTION_DIAL, uri)
+        }.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            log("Failed to start call: ${e.message}")
+        }
     }
 }
