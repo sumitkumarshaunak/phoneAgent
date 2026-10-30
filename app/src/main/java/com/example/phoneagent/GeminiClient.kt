@@ -69,4 +69,56 @@ Rules:
             .getString("text")
         return JSONObject(out.trim().removePrefix("```json").removeSuffix("```").trim())
     }
+
+    fun analyzeMessage(apiKey: String, sender: String, message: String, instruction: String): JSONObject {
+        val systemPrompt = """
+You are an AI assistant processing incoming WhatsApp messages on the user's phone.
+Analyze the incoming message based on the user's instructions.
+Decide if an automatic reply is appropriate, and if so, compose the exact reply text.
+Reply with ONE JSON object and nothing else:
+{"analysis": "short summary or reasoning",
+ "should_reply": true,
+ "reply": "exact reply message text if should_reply is true, otherwise empty string"}
+""".trimIndent()
+
+        val prompt = buildString {
+            append("INCOMING WHATSAPP MESSAGE:\n")
+            append("From: ").append(sender).append("\n")
+            append("Message: ").append(message).append("\n\n")
+            append("USER INSTRUCTIONS / RULES:\n")
+            append(instruction)
+        }
+
+        val body = JSONObject().apply {
+            put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt))))
+            put("contents", JSONArray().put(
+                JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+            ))
+            put("generationConfig", JSONObject()
+                .put("responseMimeType", "application/json")
+                .put("temperature", 0.3))
+        }
+
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("x-goog-api-key", apiKey)
+            connectTimeout = 15000
+            readTimeout = 30000
+            doOutput = true
+        }
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val text = stream.bufferedReader().use { it.readText() }
+        if (code !in 200..299) throw RuntimeException("Gemini HTTP $code: ${text.take(300)}")
+
+        val out = JSONObject(text)
+            .getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+            .getString("text")
+        return JSONObject(out.trim().removePrefix("```json").removeSuffix("```").trim())
+    }
 }

@@ -52,6 +52,16 @@ class AgentService : AccessibilityService() {
             return
         }
 
+        // Fast-path: Check for direct WhatsApp intent (e.g., "whatsapp Mom I'll be late", "wa 9876543210: Hello")
+        val waRegex = Regex("""^(?:send\s+)?(?:whatsapp|wa|message|text)\s+(?:to\s+)?([^\s:]+)(?:\s+on\s+whatsapp)?(?:\s*[:\s]\s*(.+))?$""", RegexOption.IGNORE_CASE)
+        val waMatch = waRegex.find(goal.trim())
+        if (waMatch != null) {
+            val target = waMatch.groupValues[1].trim()
+            val message = waMatch.groupValues.getOrNull(2)?.trim() ?: ""
+            handleDirectWhatsApp(target, message)
+            return
+        }
+
         job = scope.launch { runAgent(goal, apiKey) }
     }
 
@@ -218,5 +228,93 @@ class AgentService : AccessibilityService() {
         } catch (e: Exception) {
             log("Failed to start call: ${e.message}")
         }
+    }
+
+    private fun handleDirectWhatsApp(target: String, message: String) {
+        log("Goal: WhatsApp '$target'${if (message.isNotEmpty()) ": \"$message\"" else ""}")
+
+        if (target.matches(Regex("""^[+]?[\d\s\-()]{7,}$"""))) {
+            val cleaned = normalizePhoneNumber(target)
+            log("Direct phone number detected ($cleaned). Opening WhatsApp...")
+            dispatchWhatsApp(cleaned, message)
+            return
+        }
+
+        val contacts = findContacts(target)
+        if (contacts.isEmpty()) {
+            log("❌ No contact found matching '$target'. Please verify the name or enter the number directly.")
+            return
+        }
+
+        val uniqueNumbers = contacts.distinctBy { it.number.replace(Regex("""[^0-9+]"""), "") }
+        when {
+            uniqueNumbers.size == 1 -> {
+                val match = uniqueNumbers.first()
+                val cleaned = normalizePhoneNumber(match.number)
+                log("💬 Found number for '${match.name}': ${match.number}. Opening WhatsApp...")
+                dispatchWhatsApp(cleaned, message)
+            }
+            else -> {
+                log("⚠️ Multiple contacts found for '$target':")
+                uniqueNumbers.forEachIndexed { i, c ->
+                    log("   [${i + 1}] ${c.name} — ${c.number} (${c.type})")
+                }
+                log("👉 Please specify the exact name or number to message.")
+            }
+        }
+    }
+
+    private fun normalizePhoneNumber(phone: String): String {
+        return phone.replace(Regex("""[^0-9]"""), "").trimStart('0')
+    }
+
+    private fun dispatchWhatsApp(cleanedNumber: String, message: String) {
+        val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanedNumber&text=${Uri.encode(message)}")
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            setPackage("com.whatsapp")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+            if (message.isNotEmpty()) {
+                scope.launch {
+                    autoClickWhatsAppSend()
+                }
+            }
+        } catch (e: Exception) {
+            log("Failed to open WhatsApp: ${e.message}")
+        }
+    }
+
+    private suspend fun autoClickWhatsAppSend() {
+        repeat(15) {
+            delay(300)
+            val root = rootInActiveWindow ?: return@repeat
+            val sendBtn = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/send").firstOrNull()
+                ?: findByDescription(root, "Send")
+                ?: root.findAccessibilityNodeInfosByText("Send").firstOrNull()
+
+            if (sendBtn != null && sendBtn.isClickable) {
+                sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                log("✅ WhatsApp Send button clicked automatically.")
+                return
+            }
+        }
+        log("ℹ️ WhatsApp chat opened. Tap Send if not sent automatically.")
+    }
+
+    private fun findByDescription(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val deque = ArrayDeque<AccessibilityNodeInfo>()
+        deque.add(root)
+        while (deque.isNotEmpty()) {
+            val node = deque.removeFirst()
+            if (node.contentDescription?.toString().equals(desc, ignoreCase = true)) {
+                return node
+            }
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { deque.add(it) }
+            }
+        }
+        return null
     }
 }
